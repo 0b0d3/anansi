@@ -1,0 +1,37 @@
+# ANANSI Default Configuration
+
+# Core settings
+paranoia_level = 0.8          # 0.0-1.0, higher = more paranoid
+reality_flux_rate = 0.5       # How often reality changes for observers
+mutation_rate = 0.3           # Defense evolution rate
+illusion_density = 0.6        # Percentage of system that's illusion
+entropy_threshold = 0.7       # Minimum entropy before boosting
+
+# Defense settings
+[defense]
+enable_phantoms = true
+enable_mirrors = true
+enable_traps = true
+max_phantom_processes = 100
+scorched_earth_threshold = 0.95
+
+# Deception settings
+[deception]
+fake_services = ["ssh", "http", "https", "ftp", "telnet"]
+honeypot_ports = [8080, 8443, 3389, 1433]
+log_manipulation = true
+filesystem_mazes = true
+
+# Kernel settings
+[kernel]
+load_kernel_module = true
+load_ebpf_programs = true
+syscall_interception = true
+memory_manipulation = true
+
+# Logging
+[logging]
+level = "info"
+file = "/var/log/anansi.log"
+rotate_size = "100MB"
+keep_backups = 5
