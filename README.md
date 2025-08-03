@@ -161,7 +161,13 @@ This is experimental software. Contributions welcome but please understand the c
 
 ## License
 
-GPL-3.0 - See LICENSE file
+DARX-Anansi License (Modified MIT)
+
+This software is released under a modified MIT License with the following additional restriction:
+
+⚠️ This software may not be used in military, surveillance, or government infrastructure without explicit written permission from the author.
+
+See LICENSE file for full terms.
 
 
 ## Disclaimer
