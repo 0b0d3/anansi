@@ -236,7 +236,11 @@ impl DefenseEngine {
         // This is the nuclear option
         // Create maximum chaos while preserving core functionality
 
-        // Spawn chaos processes
+        // Spawn a number of "chaos" tasks.  Each task simply wakes up on a
+        // timer and logs a heartbeat; the work is intentionally lightweight so
+        // that the system isn't overloaded.  In previous versions this code
+        // performed a busy‑wait, which drove CPU usage sky high when dozens of
+        // tasks were running simultaneously.
         for i in 0..100 {
             tokio::spawn(async move {
                 create_chaos_process(i).await;
@@ -478,15 +482,23 @@ enum ResponseStrategy {
     Default,
 }
 
-// Chaos process for scorched earth
+// Chaos process for scorched earth (simulated activity with timers)
+// The original implementation burnt CPU cycles with a busy-for loop.  That
+// pattern caused high load when many tasks were spawned.  Switch to a
+// periodic timer so each task sleeps most of the time and only wakes up to
+// tick a counter or log a heartbeat.  This keeps the tasks alive without
+// consuming CPU.
 async fn create_chaos_process(id: u32) {
     let name = format!("chaos_{}", id);
+
+    // use an interval rather than a manual sleep loop; the timer handles
+    // sleeping efficiently and yields to the scheduler
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+
     loop {
-        // Simulate CPU usage
-        for _ in 0..1000000 {
-            std::hint::black_box(id * id);
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        interval.tick().await;
+        // lightweight placeholder work; remove busy computation entirely
+        debug!("{} heartbeat", name);
     }
 }
 
