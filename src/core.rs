@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use ring::rand::{SecureRandom, SystemRandom};
+use std::io::Read;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn, debug};
 
@@ -456,9 +457,17 @@ impl EntropyPool {
     }
 
     pub async fn harvest(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        use tokio::time::Duration;
         for source in &mut self.sources {
-            let entropy = source.collect().await?;
-            self.pool.extend_from_slice(&entropy);
+            // Bound each source collection to avoid blocking the whole harvest
+            match tokio::time::timeout(Duration::from_millis(100), source.collect()).await {
+                Ok(Ok(entropy)) => self.pool.extend_from_slice(&entropy),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    // Source timed out; skip it
+                    warn!("Entropy source timed out");
+                }
+            }
         }
 
         // Mix pool
@@ -617,14 +626,12 @@ impl TimingEntropySource {
 
 impl EntropySource for TimingEntropySource {
     fn collect(&mut self) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn std::error::Error>>> + Send + '_>> {
-        Box::pin(async move {
-            let now = std::time::Instant::now();
-            let delta = now.duration_since(self.last_time);
-            self.last_time = now;
-
-            let nanos = delta.as_nanos() as u64;
-            Ok(nanos.to_le_bytes().to_vec())
-        })
+        // Compute timing delta synchronously to avoid holding a borrow across await points
+        let now = std::time::Instant::now();
+        let delta = now.duration_since(self.last_time);
+        self.last_time = now;
+        let nanos = delta.as_nanos() as u64;
+        Box::pin(async move { Ok(nanos.to_le_bytes().to_vec()) })
     }
 }
 
@@ -639,11 +646,11 @@ impl SystemEntropySource {
 impl EntropySource for SystemEntropySource {
     fn collect(&mut self) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn std::error::Error>>> + Send + '_>> {
         Box::pin(async move {
-            // Collect from /dev/urandom
-            match std::fs::read("/dev/urandom") {
-                Ok(data) => Ok(data.into_iter().take(32).collect()),
-                Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
-            }
+            // Read a fixed number of bytes from /dev/urandom to avoid blocking or reading to EOF
+            let mut f = std::fs::File::open("/dev/urandom").map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+            let mut buf = [0u8; 32];
+            std::io::Read::read_exact(&mut f, &mut buf).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+            Ok(buf.to_vec())
         })
     }
 }
