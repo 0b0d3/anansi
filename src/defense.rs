@@ -241,6 +241,8 @@ impl DefenseEngine {
         // that the system isn't overloaded.  In previous versions this code
         // performed a busy‑wait, which drove CPU usage sky high when dozens of
         // tasks were running simultaneously.
+        // solved 
+        
         for i in 0..100 {
             tokio::spawn(async move {
                 create_chaos_process(i).await;

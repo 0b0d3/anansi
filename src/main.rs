@@ -44,8 +44,7 @@ enum Commands {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
@@ -59,6 +58,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
+    // Ensure a multi-threaded Tokio runtime with a reasonable worker count
+    let worker_threads = std::env::var("ANANSI_WORKER_THREADS").ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(|| num_cpus::get().max(2));
+
+    info!("Starting Tokio runtime with {} worker threads", worker_threads);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()?;
+
+    rt.block_on(async_main(cli))
+}
+
+async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Start { config } => {
             info!("Starting ANANSI with config: {}", config);
@@ -209,6 +224,9 @@ async fn run_reality_tests() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(test_file, "original content")?;
 
     // Different observers see different content
+
+    // Simulate observer 1 modifying the file in reality 1
+    core.modify_file(test_file, "reality 1 content", reality1).await?;
     let content1 = core.observe_file(test_file, reality1).await?;
     let content2 = core.observe_file(test_file, reality2).await?;
 

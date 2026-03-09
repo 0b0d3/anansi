@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use ring::rand::{SecureRandom, SystemRandom};
 use std::io::Read;
+use std::path::Path;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn, debug};
 
@@ -65,9 +66,27 @@ impl AnansiCore {
             }
         };
 
-        // Write PID file
-        std::fs::create_dir_all("/var/run")?;
-        std::fs::write("/var/run/anansi.pid", std::process::id().to_string())?;
+        // Write PID file (async, non-fatal)
+        let pid_path = std::env::var("ANANSI_PID_FILE").unwrap_or_else(|_| "/var/run/anansi.pid".to_string());
+        if let Some(parent) = Path::new(&pid_path).parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                warn!("Failed to create PID directory {}: {}", parent.display(), e);
+            }
+        }
+
+        match tokio::fs::write(&pid_path, std::process::id().to_string()).await {
+            Ok(()) => info!("Wrote PID file to {}", pid_path),
+            Err(e) => {
+                warn!("Failed to write PID file to {}: {}", pid_path, e);
+                // Fallback to /tmp
+                let fallback = "/tmp/anansi.pid".to_string();
+                if let Err(e2) = tokio::fs::write(&fallback, std::process::id().to_string()).await {
+                    warn!("Failed to write fallback PID file {}: {}", fallback, e2);
+                } else {
+                    info!("Wrote PID file to fallback {}", fallback);
+                }
+            }
+        }
 
         Ok(Self {
             config,
@@ -111,7 +130,7 @@ impl AnansiCore {
         let mut observers = Vec::new();
 
         // Check for debuggers
-        if self.detect_debugger()? {
+        if self.detect_debugger().await? {
             observers.push(Observer {
                 id: ObserverId::new(),
                 observer_type: ObserverType::Debugger,
@@ -121,7 +140,7 @@ impl AnansiCore {
         }
 
         // Check for system call tracers
-        if self.detect_strace()? {
+        if self.detect_strace().await? {
             observers.push(Observer {
                 id: ObserverId::new(),
                 observer_type: ObserverType::SystemCallTracer,
@@ -140,46 +159,85 @@ impl AnansiCore {
         Ok(observers)
     }
 
-    fn detect_debugger(&self) -> Result<bool, Box<dyn std::error::Error>> {
-        // Check if we're being debugged via /proc/self/status
-        let status = std::fs::read_to_string("/proc/self/status")?;
+    async fn detect_debugger(&self) -> Result<bool, Box<dyn std::error::Error>> {
+        // Only perform /proc and ptrace-based checks on Linux
+        if !cfg!(target_os = "linux") {
+            warn!("detect_debugger: /proc and ptrace checks are skipped on non-Linux OS");
+            return Ok(false);
+        }
+
+        // Read /proc in a blocking-safe way
+        let status = match tokio::task::spawn_blocking(|| std::fs::read_to_string("/proc/self/status")).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => return Err(Box::new(e)),
+            Err(e) => return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("join error: {}", e)))),
+        };
+
         let is_traced = status.lines()
             .find(|line| line.starts_with("TracerPid:"))
-            .map(|line| {
-                let pid = line.split_whitespace().nth(1).unwrap_or("0");
-                pid != "0"
+            .and_then(|line| {
+                line.split_whitespace().nth(1)
+                    .and_then(|s| s.parse::<u32>().ok())
             })
+            .map(|pid| pid != 0)
             .unwrap_or(false);
 
-        // Also check via ptrace
+        // Also check via ptrace (run in blocking thread to be safe)
         if !is_traced {
-            unsafe {
-                let result = libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0);
-                if result == -1 {
-                    // We're already being traced
-                    return Ok(true);
-                } else {
-                    // Detach since we were just testing
-                    libc::ptrace(libc::PTRACE_DETACH, 0, 0, 0);
+            let ptrace_result = tokio::task::spawn_blocking(|| {
+                // Use safe errno-aware handling
+                unsafe {
+                    let result = libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0);
+                    if result == -1 {
+                        let err = std::io::Error::last_os_error();
+                        // If permission denied (EPERM) it's likely we're being traced
+                        if let Some(errno) = err.raw_os_error() {
+                            if errno == libc::EPERM {
+                                return Ok(Ok(true));
+                            } else {
+                                return Ok(Err(Box::new(err) as Box<dyn std::error::Error>));
+                            }
+                        } else {
+                            return Ok(Err(Box::new(err) as Box<dyn std::error::Error>));
+                        }
+                    } else {
+                        // Detach since we were just testing; ignore detach errors
+                        let _ = libc::ptrace(libc::PTRACE_DETACH, 0, 0, 0);
+                        return Ok(Ok(false));
+                    }
                 }
-            }
+            }).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("join error: {}", e))))?;
+
+            match ptrace_result { Ok(Ok(true)) => return Ok(true), Ok(Ok(false)) => {}, Ok(Err(e)) => warn!("ptrace probe error: {}", e), Err(e) => warn!("ptrace join error: {}", e), }
         }
 
         Ok(is_traced)
     }
 
-    fn detect_strace(&self) -> Result<bool, Box<dyn std::error::Error>> {
-        // Check for common strace patterns
-        let cmdline = std::fs::read_to_string("/proc/self/cmdline")?;
+    async fn detect_strace(&self) -> Result<bool, Box<dyn std::error::Error>> {
+        // Only perform /proc-based checks on Linux
+        if !cfg!(target_os = "linux") {
+            warn!("detect_strace: /proc checks are skipped on non-Linux OS");
+            return Ok(false);
+        }
+
+        // Check for common strace patterns (use blocking-safe reads)
+        let cmdline = match tokio::task::spawn_blocking(|| std::fs::read_to_string("/proc/self/cmdline")).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(_)) => String::new(),
+            Err(e) => return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("join error: {}", e)))),
+        };
+
         let is_straced = cmdline.contains("strace");
 
         // Check parent process
         if !is_straced {
-            if let Ok(stat) = std::fs::read_to_string("/proc/self/stat") {
+            if let Ok(stat) = tokio::task::spawn_blocking(|| std::fs::read_to_string("/proc/self/stat")).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("join error: {}", e))))? {
                 let parts: Vec<&str> = stat.split_whitespace().collect();
                 if parts.len() > 3 {
                     let ppid = parts[3];
-                    if let Ok(parent_cmdline) = std::fs::read_to_string(format!("/proc/{}/cmdline", ppid)) {
+                    let parent_path = format!("/proc/{}/cmdline", ppid);
+                    if let Ok(parent_cmdline) = tokio::task::spawn_blocking(move || std::fs::read_to_string(parent_path)).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("join error: {}", e))))? {
                         return Ok(parent_cmdline.contains("strace"));
                     }
                 }
@@ -226,9 +284,25 @@ impl AnansiCore {
         // Increase entropy to make behavior unpredictable
         self.entropy_pool.write().await.boost_entropy();
 
-        // Create false breakpoints
-        if let Some(ref mut kernel) = self.kernel_interface {
-            kernel.create_false_breakpoints()?;
+        // Create false breakpoints (run in blocking thread with timeout)
+        if let Some(kernel) = self.kernel_interface.take() {
+            let op = tokio::task::spawn_blocking(move || {
+                let res = kernel.create_false_breakpoints();
+                (kernel, res)
+            });
+
+            match tokio::time::timeout(std::time::Duration::from_secs(2), op).await {
+                Ok(join_res) => match join_res {
+                    Ok((k, Ok(()))) => { self.kernel_interface = Some(k); }
+                    Ok((k, Err(e))) => { warn!("Kernel op failed: {}", e); self.kernel_interface = Some(k); }
+                    Err(e) => { warn!("Kernel op join error: {}", e); }
+                },
+                Err(_) => {
+                    warn!("Kernel create_false_breakpoints timed out");
+                    // Try to re-initialize kernel interface if possible
+                    if let Ok(ki) = KernelInterface::new() { self.kernel_interface = Some(ki); }
+                }
+            }
         }
 
         // Alter timing
@@ -241,8 +315,23 @@ impl AnansiCore {
         // This would inject false system call traces
         debug!("Injecting false system calls");
 
-        if let Some(ref mut kernel) = self.kernel_interface {
-            kernel.inject_false_syscalls()?;
+        if let Some(kernel) = self.kernel_interface.take() {
+            let op = tokio::task::spawn_blocking(move || {
+                let res = kernel.inject_false_syscalls();
+                (kernel, res)
+            });
+
+            match tokio::time::timeout(std::time::Duration::from_secs(2), op).await {
+                Ok(join_res) => match join_res {
+                    Ok((k, Ok(()))) => { self.kernel_interface = Some(k); }
+                    Ok((k, Err(e))) => { warn!("Kernel op failed: {}", e); self.kernel_interface = Some(k); }
+                    Err(e) => { warn!("Kernel op join error: {}", e); }
+                },
+                Err(_) => {
+                    warn!("Kernel inject_false_syscalls timed out");
+                    if let Ok(ki) = KernelInterface::new() { self.kernel_interface = Some(ki); }
+                }
+            }
         }
 
         Ok(())
@@ -280,8 +369,20 @@ impl AnansiCore {
         *self.shutdown.write().await = true;
 
         // Clean up
-        if let Some(ref mut kernel) = self.kernel_interface {
-            kernel.cleanup()?;
+        if let Some(kernel) = self.kernel_interface.take() {
+            let op = tokio::task::spawn_blocking(move || {
+                let res = kernel.cleanup();
+                (kernel, res)
+            });
+
+            match tokio::time::timeout(std::time::Duration::from_secs(2), op).await {
+                Ok(join_res) => match join_res {
+                    Ok((_k, Ok(()))) => { /* cleaned up */ }
+                    Ok((_k, Err(e))) => { warn!("Kernel cleanup failed: {}", e); }
+                    Err(e) => { warn!("Kernel cleanup join error: {}", e); }
+                },
+                Err(_) => { warn!("Kernel cleanup timed out"); }
+            }
         }
 
         // Remove PID file
@@ -323,7 +424,7 @@ impl AnansiCore {
 
     pub async fn observe_file(&self, path: &str, reality_id: RealityId) -> Result<String, Box<dyn std::error::Error>> {
         let reality = self.reality_engine.read().await;
-        reality.observe_file(path, reality_id)
+        reality.observe_file(path, reality_id).await
     }
 
     pub async fn simulate_attack(&mut self, attack_id: u32) -> Result<(), Box<dyn std::error::Error>> {
@@ -363,12 +464,16 @@ impl RealityEngine {
         id
     }
 
-    pub fn observe_file(&self, path: &str, reality_id: RealityId) -> Result<String, Box<dyn std::error::Error>> {
+    pub async fn observe_file(&self, path: &str, reality_id: RealityId) -> Result<String, Box<dyn std::error::Error>> {
         let reality = self.realities.get(&reality_id)
             .ok_or("Reality not found")?;
 
-        // Read actual file
-        let content = std::fs::read_to_string(path)?;
+        // Offload blocking file read to a blocking thread
+        let path_owned = path.to_string();
+        let content = tokio::task::spawn_blocking(move || -> Result<String, Box<dyn std::error::Error>> {
+            let s = std::fs::read_to_string(path_owned)?;
+            Ok(s)
+        }).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("join error: {}", e))))??;
 
         // Apply reality mutations
         let mutated = match reality.trust_level {
@@ -424,16 +529,18 @@ impl QuantumState {
     pub fn collapse(&mut self, measurement: Measurement) -> SystemState {
         self.measurement_count += 1;
 
+        let result_state = self.superposition.get(0).cloned().unwrap_or_default();
+
         let event = CollapseEvent {
             timestamp: std::time::SystemTime::now(),
             measurement,
-            result_state: self.superposition[0].clone(),
+            result_state: result_state.clone(),
         };
 
         self.collapse_events.push(event);
 
         // Return collapsed state
-        self.superposition[0].clone()
+        result_state
     }
 }
 
@@ -481,7 +588,10 @@ impl EntropyPool {
     fn mix_pool(&mut self) {
         // Simple mixing by XOR with random
         let mut mix_bytes = vec![0u8; 32];
-        self.random.fill(&mut mix_bytes).unwrap();
+        if let Err(e) = self.random.fill(&mut mix_bytes) {
+            warn!("mix_pool: failed to fill random bytes: {:?}", e);
+            return;
+        }
 
         for (i, byte) in self.pool.iter_mut().enumerate() {
             *byte ^= mix_bytes[i % 32];
@@ -490,25 +600,34 @@ impl EntropyPool {
 
     pub fn get_entropy_bytes(&self, count: usize) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let mut bytes = vec![0u8; count];
-        self.random.fill(&mut bytes).map_err(|_| "Failed to generate random bytes")?;
+        self.random.fill(&mut bytes).map_err(|_| Box::<dyn std::error::Error>::from("Failed to generate random bytes"))?;
         Ok(bytes)
     }
 
     pub fn get_random_u64(&self) -> u64 {
         let mut bytes = [0u8; 8];
-        self.random.fill(&mut bytes).unwrap();
+        if let Err(e) = self.random.fill(&mut bytes) {
+            warn!("get_random_u64: RNG fill failed: {:?}", e);
+            return 0;
+        }
+
         u64::from_le_bytes(bytes)
     }
 
     pub fn boost_entropy(&mut self) {
         // Add extra randomness when under attack
         let mut boost = vec![0u8; 256];
-        self.random.fill(&mut boost).unwrap();
-        self.pool.extend_from_slice(&boost);
-        self.mix_pool();
+        if let Err(e) = self.random.fill(&mut boost) {
+            warn!("boost_entropy: RNG fill failed: {:?}", e);
+        } else {
+            self.pool.extend_from_slice(&boost);
+            self.mix_pool();
+        }
     }
 }
 
+
+// Defense Engine - analyzes and responds to attacks
 // Types and traits
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RealityId(u64);
@@ -646,11 +765,87 @@ impl SystemEntropySource {
 impl EntropySource for SystemEntropySource {
     fn collect(&mut self) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Box<dyn std::error::Error>>> + Send + '_>> {
         Box::pin(async move {
-            // Read a fixed number of bytes from /dev/urandom to avoid blocking or reading to EOF
-            let mut f = std::fs::File::open("/dev/urandom").map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-            let mut buf = [0u8; 32];
-            std::io::Read::read_exact(&mut f, &mut buf).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-            Ok(buf.to_vec())
+            // Offload blocking read to a blocking thread
+            let res = tokio::task::spawn_blocking(|| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+                let mut f = std::fs::File::open("/dev/urandom").map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+                let mut buf = [0u8; 32];
+                std::io::Read::read_exact(&mut f, &mut buf).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+                Ok(buf.to_vec())
+            }).await.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("join error: {}", e))))?;
+
+            res
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    // Ensure PID file goes to a writable location during tests
+    fn ensure_test_pid_path() {
+        std::env::set_var("ANANSI_PID_FILE", "/tmp/anansi_test.pid");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_entropy_harvest_non_blocking_current_thread() {
+        ensure_test_pid_path();
+
+        let pool = EntropyPool::new();
+        let pool = Arc::new(tokio::sync::Mutex::new(pool));
+
+        let heartbeat = Arc::new(AtomicUsize::new(0));
+        let hb = heartbeat.clone();
+
+        // Heartbeat task that should make progress while harvest runs
+        let hb_task = tokio::spawn(async move {
+            for _ in 0..50 {
+                hb.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+
+        // Run harvest while heartbeat is running
+        {
+            let mut p = pool.lock().await;
+            p.harvest().await.expect("harvest failed");
+        }
+
+        // Wait a moment to let heartbeat run
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let count = heartbeat.load(Ordering::SeqCst);
+        assert!(count > 0, "heartbeat did not progress during harvest");
+
+        let _ = hb_task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_defense_cycle_non_blocking_multi_thread() {
+        ensure_test_pid_path();
+
+        let config = AnansiConfig::default();
+        let mut core = AnansiCore::new(config).await.expect("core init failed");
+
+        let heartbeat = Arc::new(AtomicUsize::new(0));
+        let hb = heartbeat.clone();
+
+        let hb_task = tokio::spawn(async move {
+            while hb.load(Ordering::SeqCst) < 10 {
+                hb.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        });
+
+        // Run a defense_cycle which uses async operations that should not block progress
+        core.defense_cycle().await.expect("defense_cycle failed");
+
+        // Wait a bit and ensure heartbeat progressed
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let count = heartbeat.load(Ordering::SeqCst);
+        assert!(count > 0, "heartbeat did not progress during defense_cycle");
+
+        let _ = hb_task.await;
     }
 }
